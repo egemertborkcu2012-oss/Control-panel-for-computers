@@ -1,0 +1,665 @@
+import csv
+import os
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+from collections import deque
+from datetime import datetime
+from tkinter import filedialog, messagebox, ttk
+
+import psutil
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+except ImportError:
+    pystray = None
+    Image = None
+    ImageDraw = None
+
+try:
+    from watchdog.events import FileSystemEventHandler
+    from watchdog.observers import Observer
+except ImportError:
+    FileSystemEventHandler = None
+    Observer = None
+
+
+BG = "#10141c"
+PANEL = "#191f2b"
+PANEL_ALT = "#202837"
+TEXT = "#edf2f7"
+MUTED = "#8e9aab"
+BLUE = "#6aa9ff"
+GREEN = "#52d6a0"
+ORANGE = "#ffb454"
+RED = "#ff657a"
+
+
+class SystemMonitor:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Sistem Takip ve Görev Yöneticisi")
+        self.root.geometry("790x690")
+        self.root.minsize(690, 590)
+        self.root.configure(bg=BG)
+        self.root.protocol("WM_DELETE_WINDOW", self.hide_or_exit)
+
+        self.running = True
+        self.tray_icon = None
+        self.observer = None
+        self.critical_resources = set()
+        self.history_cpu = deque([0] * 60, maxlen=60)
+        self.history_ram = deque([0] * 60, maxlen=60)
+        self.security_queue = queue.Queue()
+        self.scanning_paths = set()
+        self.watch_timers = {}
+        self.log_lock = threading.Lock()
+        self.log_path = self._get_log_path()
+        self.quarantine_path = self._get_quarantine_path()
+
+        self._configure_styles()
+        self._build_ui()
+        self._start_tray()
+        self._start_download_watcher()
+        self.update_stats()
+        self.refresh_processes(schedule=True)
+        self.root.after(400, self._poll_security_queue)
+
+    def _configure_styles(self):
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("TNotebook", background=BG, borderwidth=0)
+        style.configure("TNotebook.Tab", background=PANEL_ALT, foreground=TEXT, padding=(14, 8))
+        style.map("TNotebook.Tab", background=[("selected", PANEL)], foreground=[("selected", BLUE)])
+        style.configure(
+            "Treeview", background=PANEL, fieldbackground=PANEL, foreground=TEXT,
+            rowheight=25, borderwidth=0
+        )
+        style.configure("Treeview.Heading", background=PANEL_ALT, foreground=TEXT, padding=6)
+        style.map("Treeview", background=[("selected", "#304968")], foreground=[("selected", TEXT)])
+
+    def _build_ui(self):
+        header = tk.Frame(self.root, bg=BG)
+        header.pack(fill="x", padx=18, pady=(14, 10))
+        tk.Label(header, text="SİSTEM TAKİP", bg=BG, fg=TEXT, font=("TkDefaultFont", 15, "bold")).pack(side="left")
+        tk.Label(header, text="ÇEVRİMDIŞI", bg=BG, fg=GREEN, font=("TkDefaultFont", 8, "bold")).pack(side="right", pady=(5, 0))
+
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        self.monitor_tab = tk.Frame(self.notebook, bg=BG)
+        self.tasks_tab = tk.Frame(self.notebook, bg=BG)
+        self.security_tab = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(self.monitor_tab, text="Sistem")
+        self.notebook.add(self.tasks_tab, text="Görev Yöneticisi")
+        self.notebook.add(self.security_tab, text="Dosya Güvenliği")
+        self._build_monitor_tab()
+        self._build_tasks_tab()
+        self._build_security_tab()
+
+        footer = tk.Frame(self.root, bg=BG)
+        footer.pack(fill="x", padx=18, pady=(0, 12))
+        tk.Button(
+            footer, text="Tepsiye küçült", command=self.hide_window, bg=PANEL_ALT,
+            fg=TEXT, activebackground="#303c50", activeforeground=TEXT,
+            relief="flat", bd=0, padx=12, pady=7, font=("TkDefaultFont", 9), cursor="hand2"
+        ).pack(side="left")
+        tk.Button(
+            footer, text="Çıkış", command=self.quit, bg=PANEL_ALT, fg=MUTED,
+            activebackground="#303c50", activeforeground=TEXT,
+            relief="flat", bd=0, padx=12, pady=7, font=("TkDefaultFont", 9), cursor="hand2"
+        ).pack(side="right")
+
+    def _build_monitor_tab(self):
+        self.status = tk.Label(
+            self.monitor_tab, text="Sistem normal", bg="#17352f", fg=GREEN,
+            font=("TkDefaultFont", 9), anchor="w", padx=11, pady=8
+        )
+        self.status.pack(fill="x", padx=3, pady=(5, 9))
+        self.antivirus_health = tk.Label(
+            self.monitor_tab,
+            text=f"Antivirus: kontrol ediliyor  ·  Karantina: {self.quarantine_path}",
+            bg=PANEL, fg=ORANGE, font=("TkDefaultFont", 8), anchor="w",
+            padx=10, pady=7, justify="left", wraplength=700
+        )
+        self.antivirus_health.pack(fill="x", padx=3, pady=(0, 8))
+        grid = tk.Frame(self.monitor_tab, bg=BG)
+        grid.pack(fill="x", padx=3)
+        self.metric_labels = {}
+        self.detail_labels = {}
+        metrics = [
+            ("cpu", "İŞLEMCİ", BLUE), ("ram", "BELLEK", GREEN),
+            ("disk", "DEPOLAMA", ORANGE), ("temp", "İŞLEMCİ SICAKLIĞI", RED),
+        ]
+        for index, (key, title, color) in enumerate(metrics):
+            card = tk.Frame(grid, bg=PANEL, highlightthickness=1, highlightbackground="#273142")
+            card.grid(row=index // 2, column=index % 2, sticky="nsew", padx=5, pady=5)
+            grid.columnconfigure(index % 2, weight=1, uniform="metric")
+            tk.Label(card, text=title, bg=PANEL, fg=MUTED, font=("TkDefaultFont", 8, "bold")).pack(anchor="w", padx=12, pady=(9, 2))
+            value = tk.Label(card, text="--", bg=PANEL, fg=color, font=("TkDefaultFont", 22, "bold"))
+            value.pack(anchor="w", padx=12)
+            detail = tk.Label(card, text="Ölçülüyor...", bg=PANEL, fg=MUTED, font=("TkDefaultFont", 8))
+            detail.pack(anchor="w", padx=12, pady=(0, 9))
+            self.metric_labels[key] = value
+            self.detail_labels[key] = detail
+
+        chart_header = tk.Frame(self.monitor_tab, bg=BG)
+        chart_header.pack(fill="x", padx=7, pady=(9, 5))
+        tk.Label(chart_header, text="KAYNAK KULLANIMI", bg=BG, fg=TEXT, font=("TkDefaultFont", 9, "bold")).pack(side="left")
+        tk.Label(chart_header, text="son 60 sn", bg=BG, fg=MUTED, font=("TkDefaultFont", 8)).pack(side="right")
+        self.chart = tk.Canvas(self.monitor_tab, height=160, bg=PANEL, highlightthickness=0)
+        self.chart.pack(fill="both", expand=True, padx=3)
+        self.chart.bind("<Configure>", lambda _event: self.draw_chart())
+        legend = tk.Frame(self.monitor_tab, bg=BG)
+        legend.pack(fill="x", padx=7, pady=(6, 0))
+        tk.Label(legend, text="● CPU", bg=BG, fg=BLUE, font=("TkDefaultFont", 8)).pack(side="left", padx=(0, 14))
+        tk.Label(legend, text="● RAM", bg=BG, fg=GREEN, font=("TkDefaultFont", 8)).pack(side="left")
+
+    def _build_tasks_tab(self):
+        tk.Label(
+            self.tasks_tab, text="Çalışan işlemler", bg=BG, fg=TEXT,
+            font=("TkDefaultFont", 11, "bold")
+        ).pack(anchor="w", padx=8, pady=(8, 3))
+        tk.Label(
+            self.tasks_tab, text="Liste yaklaşık her 2 saniyede yenilenir. İşlemi sonlandırmak kaydedilmemiş verileri kaybettirebilir.",
+            bg=BG, fg=MUTED, font=("TkDefaultFont", 8), wraplength=700, justify="left"
+        ).pack(anchor="w", padx=8, pady=(0, 8))
+        columns = ("pid", "name", "cpu", "memory", "user")
+        self.process_tree = ttk.Treeview(self.tasks_tab, columns=columns, show="headings", selectmode="browse")
+        headings = (("pid", "PID", 75), ("name", "İşlem", 230), ("cpu", "CPU %", 80), ("memory", "Bellek", 100), ("user", "Kullanıcı", 150))
+        for key, label, width in headings:
+            self.process_tree.heading(key, text=label)
+            self.process_tree.column(key, width=width, minwidth=55, anchor="w" if key in ("name", "user") else "center")
+        scrollbar = ttk.Scrollbar(self.tasks_tab, orient="vertical", command=self.process_tree.yview)
+        self.process_tree.configure(yscrollcommand=scrollbar.set)
+        controls = tk.Frame(self.tasks_tab, bg=BG)
+        controls.pack(fill="x", padx=8, pady=(0, 9))
+        self.process_count = tk.Label(controls, text="İşlemler yükleniyor...", bg=BG, fg=MUTED, font=("TkDefaultFont", 8))
+        self.process_count.pack(side="left")
+        tk.Button(
+            controls, text="Seçili işlemi sonlandır", command=self.terminate_selected,
+            bg="#49242c", fg=TEXT, activebackground="#66313d", activeforeground=TEXT,
+            relief="flat", bd=0, padx=10, pady=6, font=("TkDefaultFont", 9), cursor="hand2"
+        ).pack(side="right")
+        tk.Button(
+            controls, text="Yenile", command=self.refresh_processes,
+            bg=PANEL_ALT, fg=TEXT, activebackground="#303c50", activeforeground=TEXT,
+            relief="flat", bd=0, padx=10, pady=6, font=("TkDefaultFont", 9), cursor="hand2"
+        ).pack(side="right", padx=(0, 7))
+        self.process_tree.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=(0, 8))
+        scrollbar.pack(side="right", fill="y", padx=(0, 8), pady=(0, 8))
+
+    def _build_security_tab(self):
+        tk.Label(
+            self.security_tab, text="Yerel antivirüs taraması", bg=BG, fg=TEXT,
+            font=("TkDefaultFont", 11, "bold")
+        ).pack(anchor="w", padx=8, pady=(8, 3))
+        tk.Label(
+            text="ClamAV ile dosya/klasör tarar. Yeni dosyalar İndirilenler klasörüne geldiğinde otomatik taranır. Tespit edilen tehditler otomatik olarak karantinaya taşınır; taşınamayanlar durum alanında bildirilir. Kayıtlar aşağıdaki listeye yazılır.",
+            bg=BG, fg=MUTED, font=("TkDefaultFont", 8), wraplength=710, justify="left"
+        ).pack(anchor="w", padx=8, pady=(0, 9))
+        self.antivirus_status = tk.Label(
+            self.security_tab, text="Virüs tarayıcısı kontrol ediliyor...", bg=PANEL,
+            fg=ORANGE, anchor="w", padx=10, pady=8, font=("TkDefaultFont", 9)
+        )
+        self.antivirus_status.pack(fill="x", padx=8, pady=(0, 8))
+        self.watcher_status = tk.Label(
+            self.security_tab, text="İndirilenler klasörü izleme durumu kontrol ediliyor...",
+            bg=BG, fg=MUTED, anchor="w", font=("TkDefaultFont", 8)
+        )
+        self.watcher_status.pack(fill="x", padx=8, pady=(0, 8))
+        tk.Label(
+            self.security_tab,
+            text="ClamAV ile dosya/klasör tarar. Yeni dosyalar İndirilenler klasörüne geldiğinde otomatik taranır. Tespit edilen tehditler otomatik olarak karantinaya taşınır; taşınamayanlar durum alanında bildirilir. Kayıtlar aşağıdaki listeye yazılır.",
+            bg=BG, fg=MUTED, font=("TkDefaultFont", 8), wraplength=710, justify="left"
+        ).pack(anchor="w", padx=8, pady=(0, 9))
+        ).pack(side="left", padx=7)
+        tk.Button(
+            buttons, text="Kayıt konumunu göster", command=self.show_log_location,
+            bg=PANEL_ALT, fg=TEXT, activebackground="#303c50", activeforeground=TEXT,
+            relief="flat", bd=0, padx=10, pady=7, font=("TkDefaultFont", 9), cursor="hand2"
+        ).pack(side="right")
+
+        tk.Label(self.security_tab, text="Tespit kayıtları", bg=BG, fg=TEXT, font=("TkDefaultFont", 10, "bold")).pack(anchor="w", padx=8, pady=(0, 5))
+        columns = ("time", "filename", "threat", "path")
+        self.detection_tree = ttk.Treeview(self.security_tab, columns=columns, show="headings")
+        for key, label, width in (
+            ("time", "Tarih / saat", 145), ("filename", "Dosya adı", 150),
+            ("threat", "Tehdit adı / türü", 175), ("path", "Dosya konumu", 250),
+        ):
+            self.detection_tree.heading(key, text=label)
+            self.detection_tree.column(key, width=width, minwidth=75, anchor="w")
+        scrollbar = ttk.Scrollbar(self.security_tab, orient="vertical", command=self.detection_tree.yview)
+        self.detection_tree.configure(yscrollcommand=scrollbar.set)
+        self.log_hint = tk.Label(
+            self.security_tab, text=f"Kayıt dosyası: {self.log_path}", bg=BG, fg=MUTED,
+            anchor="w", justify="left", wraplength=700, font=("TkDefaultFont", 7)
+        )
+        self.log_hint.pack(fill="x", padx=8, pady=(0, 7))
+        self.detection_tree.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=(0, 5))
+        scrollbar.pack(side="right", fill="y", padx=(0, 8), pady=(0, 5))
+        self._load_detection_log()
+
+    def _start_tray(self):
+        if pystray is None or Image is None:
+            return
+        try:
+            image = Image.new("RGB", (64, 64), BG)
+            draw = ImageDraw.Draw(image)
+            draw.rounded_rectangle((7, 7, 57, 57), radius=12, fill=PANEL_ALT)
+            draw.line((14, 42, 25, 30, 34, 36, 49, 18), fill=GREEN, width=4)
+            draw.ellipse((44, 13, 53, 22), fill=BLUE)
+            menu = pystray.Menu(
+                pystray.MenuItem("Göster", lambda _icon, _item: self.root.after(0, self.show_window), default=True),
+                pystray.MenuItem("Çıkış", lambda _icon, _item: self.root.after(0, self.quit)),
+            )
+            self.tray_icon = pystray.Icon("system_monitor", image, "Sistem Takip", menu)
+            threading.Thread(target=self.tray_icon.run, daemon=True).start()
+        except Exception:
+            self.tray_icon = None
+
+    def update_stats(self):
+        if not self.running:
+            return
+        try:
+            cpu = psutil.cpu_percent(interval=None)
+            memory = psutil.virtual_memory()
+            disk_root = os.environ.get("SystemDrive", "C:") + os.sep if os.name == "nt" else os.path.abspath(os.sep)
+            disk = psutil.disk_usage(disk_root)
+            temperature = self.get_temperature()
+            self.metric_labels["cpu"].config(text=f"{cpu:.0f}%")
+            self.detail_labels["cpu"].config(text=f"{psutil.cpu_count(logical=True)} mantıksal çekirdek")
+            self.metric_labels["ram"].config(text=f"{memory.percent:.0f}%")
+            self.detail_labels["ram"].config(text=f"{self.format_bytes(memory.used)} / {self.format_bytes(memory.total)}")
+            self.metric_labels["disk"].config(text=f"{disk.percent:.0f}%")
+            self.detail_labels["disk"].config(text=f"{self.format_bytes(disk.used)} / {self.format_bytes(disk.total)}")
+            self.metric_labels["temp"].config(text=f"{temperature:.0f}°C" if temperature is not None else "N/A")
+            self.detail_labels["temp"].config(text="Anlık işlemci sıcaklığı" if temperature is not None else "Bu cihazda okunamıyor")
+            self.history_cpu.append(cpu)
+            self.history_ram.append(memory.percent)
+            self.draw_chart()
+            self.update_warning({"İşlemci": cpu, "Bellek": memory.percent, "Depolama": disk.percent})
+        except (OSError, RuntimeError, psutil.Error, tk.TclError) as error:
+            if self.running:
+                self.status.config(text=f"Ölçüm alınamadı: {error}", bg="#3a2028", fg=RED)
+        if self.running:
+            self.root.after(1000, self.update_stats)
+
+    def update_warning(self, values):
+        active = {name for name, value in values.items() if value > 90}
+        if active:
+            names = ", ".join(sorted(active))
+            self.status.config(text=f"⚠ Yüksek kullanım: {names} %90'ı aştı", bg="#3a2028", fg=RED)
+            if not self.critical_resources.intersection(active):
+                self.root.bell()
+        else:
+            self.status.config(text="Sistem normal  ·  kaynak kullanımı güvenli", bg="#17352f", fg=GREEN)
+        self.critical_resources = active
+
+    def draw_chart(self):
+        if not hasattr(self, "chart"):
+            return
+        canvas = self.chart
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 10)
+        height = max(canvas.winfo_height(), 10)
+        left, right, top, bottom = 30, width - 10, 12, height - 18
+        for pct in (0, 50, 100):
+            y = bottom - (bottom - top) * pct / 100
+            canvas.create_line(left, y, right, y, fill="#2a3444", dash=(2, 4))
+            canvas.create_text(5, y, text=str(pct), anchor="w", fill=MUTED, font=("TkDefaultFont", 7))
+        for values, color in ((self.history_cpu, BLUE), (self.history_ram, GREEN)):
+            points = []
+            for index, value in enumerate(values):
+                x = left + (right - left) * index / (len(values) - 1)
+                y = bottom - (bottom - top) * max(0, min(100, value)) / 100
+                points.extend((x, y))
+            if len(points) >= 4:
+                canvas.create_line(*points, fill=color, width=2, smooth=True)
+
+    def refresh_processes(self, schedule=False):
+        if not self.running:
+            return
+        rows = []
+        for proc in psutil.process_iter(["pid", "name", "username", "memory_info"]):
+            try:
+                info = proc.info
+                cpu = proc.cpu_percent(interval=None)
+                mem = info.get("memory_info")
+                rows.append((int(info["pid"]), info.get("name") or "?", cpu, mem.rss if mem else 0, info.get("username") or "?"))
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+                continue
+        rows.sort(key=lambda row: row[2], reverse=True)
+        current_selection = self.process_tree.selection()
+        selected_pid = self.process_tree.item(current_selection[0], "values")[0] if current_selection else None
+        for item in self.process_tree.get_children():
+            self.process_tree.delete(item)
+        selected_iid = None
+        for pid, name, cpu, rss, username in rows:
+            iid = self.process_tree.insert("", "end", values=(pid, name, f"{cpu:.1f}", self.format_bytes(rss), username))
+            if str(pid) == selected_pid:
+                selected_iid = iid
+        if selected_iid:
+            self.process_tree.selection_set(selected_iid)
+        self.process_count.config(text=f"{len(rows)} işlem · otomatik yenileme 2 sn")
+        if schedule and self.running:
+            self.root.after(2000, lambda: self.refresh_processes(schedule=True))
+
+    def terminate_selected(self):
+        selected = self.process_tree.selection()
+        if not selected:
+            messagebox.showinfo("Görev Yöneticisi", "Önce listeden bir işlem seçin.", parent=self.root)
+            return
+        values = self.process_tree.item(selected[0], "values")
+        pid, name = int(values[0]), values[1]
+        if pid == os.getpid():
+            messagebox.showwarning("İşlem korunuyor", "Bu uygulamanın kendi işlemi buradan sonlandırılamaz.", parent=self.root)
+            return
+        if not messagebox.askyesno("İşlemi sonlandır", f"{name} (PID {pid}) işlemini sonlandırmak istiyor musunuz?\n\nAçık veriler kaybolabilir.", parent=self.root):
+            return
+        try:
+            proc = psutil.Process(pid)
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except psutil.TimeoutExpired:
+                if messagebox.askyesno("Yanıt vermiyor", "İşlem kapanmadı. Zorla kapatılsın mı?", parent=self.root):
+                    proc.kill()
+            self.refresh_processes()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error, OSError) as error:
+            messagebox.showerror("İşlem sonlandırılamadı", str(error), parent=self.root)
+
+    def _start_download_watcher(self):
+        download_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+        if self._find_clamscan():
+            self._set_antivirus_status("ClamAV bulundu; otomatik karantina açık. İmza veritabanının güncel olduğundan emin olun.", GREEN)
+        else:
+            self._set_antivirus_status("ClamAV bulunamadı. Tarama ve otomatik karantina kullanılamıyor.", ORANGE)
+        if Observer is None or FileSystemEventHandler is None:
+            self.watcher_status.config(text="Otomatik klasör izleme kullanılamıyor: watchdog paketi kurulu değil.", fg=ORANGE)
+            return
+        if not os.path.isdir(download_dir):
+            self.watcher_status.config(text=f"İndirilenler klasörü bulunamadı: {download_dir}", fg=ORANGE)
+            return
+
+        app = self
+
+        class DownloadHandler(FileSystemEventHandler):
+            def on_created(self, event):
+                if not event.is_directory:
+                    app.security_queue.put(("watch", event.src_path))
+
+            def on_moved(self, event):
+                if not event.is_directory:
+                    app.security_queue.put(("watch", event.dest_path))
+
+            def on_modified(self, event):
+                if not event.is_directory:
+                    app.security_queue.put(("watch", event.src_path))
+
+        try:
+            self.observer = Observer()
+            self.observer.schedule(DownloadHandler(), download_dir, recursive=True)
+            self.observer.start()
+            self.watcher_status.config(text=f"Otomatik izleme açık: {download_dir}", fg=GREEN)
+        except (OSError, RuntimeError) as error:
+            self.watcher_status.config(text=f"Klasör izleme başlatılamadı: {error}", fg=ORANGE)
+            self.observer = None
+    def _set_antivirus_status(self, text, color):
+        self.antivirus_status.config(text=text, fg=color)
+        if hasattr(self, "antivirus_health"):
+            self.antivirus_health.config(
+                text=f"Antivirus: {text}  ·  Karantina: {self.quarantine_path}", fg=color
+            )
+    def _scan_watched_file(self, path):
+        self.watch_timers.pop(path, None)
+        if os.path.isfile(path):
+            self._request_scan(path, source="watch")
+
+    def choose_scan_target(self):
+        path = filedialog.askopenfilename(title="Taranacak dosyayı seçin", parent=self.root)
+        if not path:
+            path = filedialog.askdirectory(title="veya taranacak klasörü seçin", parent=self.root)
+        if path:
+            self._request_scan(path, source="manual")
+
+    def scan_downloads(self):
+        path = os.path.join(os.path.expanduser("~"), "Downloads")
+        if not os.path.isdir(path):
+            messagebox.showerror("Klasör bulunamadı", f"İndirilenler klasörü bulunamadı:\n{path}", parent=self.root)
+            return
+        self._request_scan(path, source="manual")
+
+    def _request_scan(self, path, source):
+        path = os.path.abspath(path)
+        if path in self.scanning_paths:
+            return
+        scanner = self._find_clamscan()
+        if not scanner:
+            self._set_antivirus_status("ClamAV bulunamadı. Tarama ve otomatik karantina için ClamAV kurun.", RED)
+            if source == "manual":
+                messagebox.showerror(
+                    "ClamAV gerekli",
+                    "Dosya taraması için ClamAV (clamscan) gerekir. ClamAV kurup virüs imzalarını güncelledikten sonra yeniden deneyin.",
+                    parent=self.root,
+                )
+            return
+        self.scanning_paths.add(path)
+        self._set_antivirus_status(f"Taranıyor: {path}  ·  Tespit edilenler karantinaya taşınacak.", ORANGE)
+        threading.Thread(target=self._scan_worker, args=(scanner, path, source), daemon=True).start()
+
+    @staticmethod
+    def _find_clamscan():
+        found = shutil.which("clamscan") or shutil.which("clamscan.exe")
+        if found:
+            return found
+        if os.name == "nt":
+            candidates = [
+                os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "ClamAV", "clamscan.exe"),
+                os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "ClamAV", "clamscan.exe"),
+            ]
+            for candidate in candidates:
+                if os.path.isfile(candidate):
+                    return candidate
+        return None
+
+    def _scan_worker(self, scanner, path, source):
+        try:
+            os.makedirs(self.quarantine_path, mode=0o700, exist_ok=True)
+            if os.name != "nt":
+                os.chmod(self.quarantine_path, 0o700)
+            real_target = os.path.realpath(path)
+            real_quarantine = os.path.realpath(self.quarantine_path)
+            if real_target == real_quarantine or real_target.startswith(real_quarantine + os.sep):
+                self.security_queue.put(("scan_error", path, "Karantina klasörünün kendisi taranamaz."))
+                return
+            command = [scanner, "--infected", "--no-summary", f"--move={self.quarantine_path}"]
+            if os.path.isdir(path):
+                command.extend(("--recursive", f"--exclude-dir=^{re.escape(real_quarantine)}[/\\]?.*"))
+            command.append(path)
+            result = subprocess.run(command, capture_output=True, text=True, errors="replace", timeout=3600, check=False)
+            output = (result.stdout or "") + "\n" + (result.stderr or "")
+            detections = []
+            for line in output.splitlines():
+                match = re.match(r"^(.*): (.+) FOUND$", line.strip())
+                if match:
+                    detected_path, threat = match.groups()
+                    target = os.path.join(self.quarantine_path, os.path.basename(detected_path))
+                    quarantined = not os.path.exists(detected_path) and os.path.isfile(target)
+                    detections.append((detected_path, threat, quarantined))
+            if result.returncode == 2:
+                detail = output.strip() or "ClamAV tarama hatası verdi."
+                self.security_queue.put(("scan_error", path, detail[-1500:]))
+                return
+            if result.returncode not in (0, 1):
+                self.security_queue.put(("scan_error", path, f"ClamAV beklenmeyen çıkış kodu: {result.returncode}"))
+                return
+            timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+            for detected_path, threat, quarantined in detections:
+                record = {
+                    "time": timestamp,
+                    "filename": os.path.basename(detected_path),
+                    "threat": threat,
+                    "path": detected_path,
+                }
+                self._append_detection(record)
+                self.security_queue.put(("detection", record, quarantined))
+            quarantined_count = sum(1 for _detected_path, _threat, moved in detections if moved)
+            self.security_queue.put(("scan_done", path, source, len(detections), quarantined_count))
+        except subprocess.TimeoutExpired:
+            self.security_queue.put(("scan_error", path, "Tarama bir saat içinde tamamlanmadı ve zaman aşımına uğradı."))
+        except (OSError, subprocess.SubprocessError) as error:
+            self.security_queue.put(("scan_error", path, str(error)))
+        finally:
+            self.security_queue.put(("scan_finished", path))
+    def _poll_security_queue(self):
+        if not self.running:
+            return
+        try:
+            while True:
+                item = self.security_queue.get_nowait()
+                kind = item[0]
+                if kind == "watch":
+                    path = item[1]
+                    # İndirme/yazma işleminin tamamlanmasına kısa süre tanı.
+                    previous = self.watch_timers.pop(path, None)
+                    if previous is not None:
+                        self.root.after_cancel(previous)
+                    self.watch_timers[path] = self.root.after(3000, lambda target=path: self._scan_watched_file(target))
+                elif kind == "detection":
+                    record, quarantined = item[1], item[2]
+                    self._add_detection_row(record)
+                    if quarantined:
+                        text = f"Karantinaya taşındı: {record['filename']} — {record['threat']}"
+                    else:
+                        text = f"TEHDİT BULUNDU; karantinaya taşıma doğrulanamadı: {record['filename']} — {record['threat']}"
+                    self._set_antivirus_status(text, RED)
+                    self.root.bell()
+                elif kind == "scan_done":
+                    _, path, _source, count, quarantined_count = item
+                    if count:
+                        text = f"Tarama tamamlandı: {count} tehdit; {quarantined_count} dosya karantinaya taşındı."
+                        color = RED if quarantined_count == count else ORANGE
+                    else:
+                        text = f"Tarama tamamlandı, tehdit bulunmadı: {path}"
+                        color = GREEN
+                    self._set_antivirus_status(text, color)
+                elif kind == "scan_error":
+                    self._set_antivirus_status(f"Tarama hatası: {item[2]}", RED)
+                elif kind == "scan_finished":
+                    self.scanning_paths.discard(item[1])
+        except queue.Empty:
+            pass
+        self.root.after(400, self._poll_security_queue)
+
+    def _get_quarantine_path(self):
+        if os.name == "nt":
+            base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+        else:
+            base = os.environ.get("XDG_DATA_HOME", os.path.join(os.path.expanduser("~"), ".local", "share"))
+        return os.path.join(base, "sistem-takip", "quarantine")
+
+    def _get_log_path(self):
+        if os.name == "nt":
+            base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+        else:
+            base = os.environ.get("XDG_STATE_HOME", os.path.join(os.path.expanduser("~"), ".local", "state"))
+        return os.path.join(base, "sistem-takip", "malware_detections.csv")
+
+
+    def _append_detection(self, record):
+        os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+        with self.log_lock:
+            needs_header = not os.path.exists(self.log_path) or os.path.getsize(self.log_path) == 0
+            with open(self.log_path, "a", newline="", encoding="utf-8") as file:
+                writer = csv.DictWriter(file, fieldnames=("time", "filename", "threat", "path"))
+                if needs_header:
+                    writer.writeheader()
+                writer.writerow(record)
+
+    def _load_detection_log(self):
+        if not os.path.isfile(self.log_path):
+            return
+        try:
+            with open(self.log_path, "r", newline="", encoding="utf-8") as file:
+                for record in csv.DictReader(file):
+                    self._add_detection_row(record)
+        except (OSError, csv.Error):
+            pass
+
+    def _add_detection_row(self, record):
+        self.detection_tree.insert(
+            "", "end", values=(record.get("time", ""), record.get("filename", ""), record.get("threat", ""), record.get("path", ""))
+        )
+
+    def show_log_location(self):
+        messagebox.showinfo("Tespit kayıt dosyası", f"Kayıt dosyası:\n{self.log_path}\n\nBu CSV dosyasını elektronik tablo uygulamasıyla açabilirsiniz.", parent=self.root)
+
+    @staticmethod
+    def get_temperature():
+        sensors = getattr(psutil, "sensors_temperatures", None)
+        if sensors is None:
+            return None
+        try:
+            readings = sensors()
+            values = [entry.current for entries in readings.values() for entry in entries if entry.current is not None]
+            return max(values) if values else None
+        except (OSError, RuntimeError, AttributeError):
+            return None
+
+    @staticmethod
+    def format_bytes(value):
+        amount = float(value)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if amount < 1024 or unit == "TB":
+                return f"{amount:.1f} {unit}"
+            amount /= 1024
+
+    def hide_or_exit(self):
+        if self.tray_icon is not None:
+            self.hide_window()
+        else:
+            self.quit()
+
+    def hide_window(self):
+        self.root.withdraw()
+
+    def show_window(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def quit(self):
+        if not self.running:
+            return
+        self.running = False
+        if self.observer is not None:
+            try:
+                self.observer.stop()
+                self.observer.join(timeout=2)
+            except RuntimeError:
+                pass
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+        self.root.destroy()
+
+
+def main():
+    root = tk.Tk()
+    SystemMonitor(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
